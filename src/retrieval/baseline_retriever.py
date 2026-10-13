@@ -1,21 +1,26 @@
 from retrieval.base_retriever import BaseRetriever, RetrievedData
 from pymilvus import MilvusClient
-from pymilvus.model.dense import OpenAIEmbeddingFunction
+from openai import OpenAI
 from util.constants import MILVUS_DB_PATH, MILVUS_COLLECTION_NAME_BASELINE, MILVUS_META_ATTRIBUTE_TEXT, MILVUS_META_ATTRIBUTE_PAGE, MILVUS_META_ATTRIBUTE_FILE, MILVUS_BASELINE_SOURCE_COUNT, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
 from dotenv import load_dotenv
 load_dotenv()
 
 class BaselineRetriever(BaseRetriever):
     def __init__(self):
-        self.embedding_fn = OpenAIEmbeddingFunction(model_name=EMBEDDING_MODEL, dimensions=EMBEDDING_DIMENSIONS)
+        self.embedding_client = OpenAI()
         self.client = None
         super().__init__()
 
     def retrieve(self, query):
         if self.client is None:
             self.client = MilvusClient(MILVUS_DB_PATH)
+            self.client.load_collection(MILVUS_COLLECTION_NAME_BASELINE)
         
-        query_vectors = self.embedding_fn.encode_queries([query])
+        query_vectors = [self.embedding_client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=query,
+            dimensions=EMBEDDING_DIMENSIONS,
+        ).data[0].embedding]
 
         res = self.client.search(
             collection_name=MILVUS_COLLECTION_NAME_BASELINE,  # target collection

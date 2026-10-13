@@ -16,7 +16,7 @@ class BaseIndexer:
         
     def index_data(self, data_files):
         raise NotImplementedError("Subclasses must implement this method.")
-    
+
     def createCollectionIfRequired(self, collection_name):
         if self.client is None:
             self.client = MilvusClient(MILVUS_DB_PATH)
@@ -25,6 +25,7 @@ class BaseIndexer:
             self.client.create_collection(
                 collection_name=collection_name,
                 dimension=EMBEDDING_DIMENSIONS,
+                auto_id=True,
             )
     
     def index_file(self, data_file, collection_name, category="", documentation="", version=""):
@@ -46,8 +47,7 @@ class BaseIndexer:
             batch = chunk_texts[i:i + batch_size]
             batch_vectors = self.embedding_fn.encode_documents(batch)
             data = [
-                {"id": i, 
-                "vector": batch_vectors[i],
+                {"vector": batch_vectors[i],
                 MILVUS_META_ATTRIBUTE_TEXT: chunks[i].chunk, 
                 MILVUS_META_ATTRIBUTE_PAGE: chunks[i].page, 
                 MILVUS_META_ATTRIBUTE_FILE: data_file,
@@ -60,4 +60,4 @@ class BaseIndexer:
             self.client.insert(collection_name=collection_name, data=data)
             time.sleep(1)
 
-    
+

@@ -1,6 +1,7 @@
 from retrieval.versionrag_retriever_db import RetrievalParam, RetrievalType
 from util.llm_client import LLMClient
 import json
+import re
 
 system_prompt = """
             You are an advanced AI assistant specializing in query classification and parameter extraction.
@@ -64,5 +65,12 @@ class VersionRAGRetrieverParser:
         print(f"retrieval mode: {parsed_result}")
         parsed_retrieval_type = parsed_result["retrieval"]
         parsed_params = parsed_result["parameters"]
+        # A question about a rule on a specific date asks for policy content,
+        # even when a version ID is mentioned. It does not ask for a changelog.
+        if (re.search(r"\bas of\b|\bon\s+\d{4}-\d{2}-\d{2}\b", query, re.IGNORECASE)
+                and not re.search(r"\b(?:changed?|changes|difference|introduced|added|removed)\b",
+                                  query, re.IGNORECASE)):
+            parsed_retrieval_type = "ContentRetrieval"
+            parsed_params.setdefault("query", query)
         retrieval_type = RetrievalType[parsed_retrieval_type]
-        return RetrievalParam(retrieval_type=retrieval_type, params=parsed_params)
+        return RetrievalParam(retrieval_type=retrieval_type, params=parsed_params, original_query=query)

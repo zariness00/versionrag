@@ -1,10 +1,13 @@
 from enum import Enum
+from pathlib import Path
+from datetime import date
+import re
 from util.graph_client import GraphClient
 from util.llm_client import LLMClient
 from pymilvus import MilvusClient
-from pymilvus.model.dense import OpenAIEmbeddingFunction
+from openai import OpenAI
 from retrieval.base_retriever import RetrievedData
-from util.constants import MILVUS_DB_PATH, MILVUS_COLLECTION_NAME_VersionRAG, MILVUS_META_ATTRIBUTE_TEXT, MILVUS_META_ATTRIBUTE_PAGE, MILVUS_META_ATTRIBUTE_FILE, MILVUS_META_ATTRIBUTE_CATEGORY, MILVUS_META_ATTRIBUTE_DOCUMENTATION, MILVUS_META_ATTRIBUTE_VERSION, MILVUS_META_ATTRIBUTE_TYPE, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
+from util.constants import MILVUS_DB_PATH, MILVUS_COLLECTION_NAME_VERSIONRAG, MILVUS_META_ATTRIBUTE_TEXT, MILVUS_META_ATTRIBUTE_PAGE, MILVUS_META_ATTRIBUTE_FILE, MILVUS_META_ATTRIBUTE_CATEGORY, MILVUS_META_ATTRIBUTE_DOCUMENTATION, MILVUS_META_ATTRIBUTE_VERSION, MILVUS_META_ATTRIBUTE_TYPE, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -14,16 +17,18 @@ class RetrievalType(Enum):
     ContentRetrieval = 3
 
 class RetrievalParam:
-    def __init__(self, retrieval_type: RetrievalType, params):
+    def __init__(self, retrieval_type: RetrievalType, params, original_query: str | None = None):
         self.retrieval_type = retrieval_type
         self.params = params
+        self.original_query = original_query
 
 class VersionRAGRetrieverDatabase:
     def __init__(self):
         self.graph = GraphClient()
         self.llm_client = LLMClient()
         self.vdb = MilvusClient(MILVUS_DB_PATH)
-        self.vdb_embedding = OpenAIEmbeddingFunction(model_name=EMBEDDING_MODEL, dimensions=EMBEDDING_DIMENSIONS)
+        self.vdb.load_collection(MILVUS_COLLECTION_NAME_VERSIONRAG)
+        self.embedding_client = OpenAI()
 
     def retrieve(self, params: RetrievalParam) -> RetrievedData:
         self.preprocess_params(params=params)
@@ -31,7 +36,9 @@ class VersionRAGRetrieverDatabase:
             case RetrievalType.VersionRetrieval:
                 return self.wrap("Retrieved availabe versions in system", self.retrieve_versions(params=params.params))
             case RetrievalType.ChangeRetrieval:
-                return self.wrap("Retrieved available changes in system", self.retrieve_changes(params=params.params))
+                return self.wrap("Retrieved available changes in system", self.retrieve_changes(
+                    params=params.params, original_query=params.original_query
+                ))
             case RetrievalType.ContentRetrieval:
                 return self.wrap("Retrieved available content in system", self.retrieve_content(params=params.params))
 
@@ -42,17 +49,84 @@ class VersionRAGRetrieverDatabase:
             
     def preprocess_params(self, params: RetrievalParam):
         parameters = params.params
+        # A policy version ID identifies its document more reliably than the
+        # query parser's guessed category or documentation name.
+        policy_pattern = r"\b(P\d{2})-v(\d+)\b"
+        policy_match = (re.search(policy_pattern, params.original_query or "", re.IGNORECASE)
+                        or re.search(policy_pattern, parameters.get("version") or "", re.IGNORECASE))
+        if policy_match:
+            policy_version_id = f"{policy_match.group(1).upper()}-v{policy_match.group(2)}"
+            resolved = self.resolve_policy_version_from_file(policy_version_id)
+            if resolved:
+                parameters.update(resolved)
+                return
+
         category_name = parameters.get("category")
         if category_name:
             category_name = self.retrieve_category_name(category_name)
+            parameters["category"] = category_name
             
         documentation_name = parameters.get("documentation")
         if documentation_name:
             documentation_name = self.retrieve_documentation_name(category_name=category_name, documentation_input_name=documentation_name)
+            parameters["documentation"] = documentation_name
 
         version_name = parameters.get("version")
+        resolved_from_date = False
+        if not version_name and params.retrieval_type == RetrievalType.ContentRetrieval:
+            date_match = re.search(r"\b(?:as of|on)\s+(\d{4}-\d{2}-\d{2})\b", params.original_query or "", re.IGNORECASE)
+            if date_match and category_name and documentation_name:
+                version_name = self.resolve_version_as_of(category_name, documentation_name, date_match.group(1))
+                if version_name:
+                    parameters["version"] = version_name
+                    resolved_from_date = True
         if version_name:
-            version_name = self.retrieve_version(category_name=category_name, documentation_name=documentation_name, version_input_name=version_name)
+            # A version selected from the graph already has its exact stored name.
+            if not resolved_from_date:
+                version_name = self.retrieve_version(category_name=category_name, documentation_name=documentation_name, version_input_name=version_name)
+                parameters["version"] = version_name
+
+    def resolve_policy_version_from_file(self, policy_version_id: str):
+        query = """
+        MATCH (category:Category)-[:CONTAINS]->(documentation:Documentation)
+              -[:HAS_VERSION]->(version:Version)-[:HAS_CONTENT]->(content:Content)
+        WHERE content.file ENDS WITH $filename
+        RETURN category.name AS category, documentation.name AS documentation,
+               version.version AS version
+        LIMIT 1
+        """
+        with self.graph.session() as session:
+            record = session.run(query, filename=f"/{policy_version_id}.md").single()
+        return record.data() if record else None
+
+    def resolve_version_as_of(self, category_name: str, documentation_name: str, as_of: str):
+        """Choose the latest effective policy version on or before a date."""
+        query = """
+        MATCH (:Category {name: $category_name})-[:CONTAINS]->
+              (:Documentation {name: $documentation_name})-[:HAS_VERSION]->
+              (version:Version)-[:HAS_CONTENT]->(content:Content)
+        WHERE content.file ENDS WITH '.md'
+          AND NOT content.file ENDS WITH '-release-notes.md'
+        RETURN DISTINCT version.version AS version, content.file AS file
+        """
+        with self.graph.session() as session:
+            entries = [record.data() for record in session.run(
+                query, category_name=category_name, documentation_name=documentation_name
+            )]
+        cutoff = date.fromisoformat(as_of)
+        candidates = []
+        for entry in entries:
+            try:
+                with Path(entry["file"]).open(encoding="utf-8") as file:
+                    header = file.read(2048)
+            except (OSError, UnicodeError, TypeError):
+                continue
+            effective = re.search(r"^Effective from:\s*(\d{4}-\d{2}-\d{2})\s*$", header, re.MULTILINE)
+            if effective:
+                effective_date = date.fromisoformat(effective.group(1))
+                if effective_date <= cutoff:
+                    candidates.append((effective_date, entry["version"]))
+        return max(candidates)[1] if candidates else None
 
     def retrieve_categories(self):
         query = """
@@ -112,7 +186,9 @@ class VersionRAGRetrieverDatabase:
             query += " WHERE d.name = $documentation_name"
         query += """
         MATCH (d)-[:HAS_VERSION]->(v:Version)
-        RETURN d.name AS documentation, v.version AS version
+        OPTIONAL MATCH (v)-[:HAS_CONTENT]->(content:Content {type: 'WithoutChangelog'})
+        RETURN d.name AS documentation, v.version AS version,
+               head(collect(content.file)) AS file
         ORDER BY d.name, v.version
         """
         
@@ -123,12 +199,37 @@ class VersionRAGRetrieverDatabase:
         if not versions:
             return "No versions found for given parameters."
 
-        return "\n".join(f"{i}. Documentation: {entry['documentation']}\n   Version: {entry['version']}" for i, entry in enumerate(versions, 1))
+        lines = []
+        for i, entry in enumerate(versions, 1):
+            line = f"{i}. Documentation: {entry['documentation']}\n   Version: {entry['version']}"
+            source_file = entry.get("file")
+            if source_file and Path(source_file).suffix.lower() in {".md", ".txt"}:
+                try:
+                    with Path(source_file).open(encoding="utf-8") as file:
+                        header = file.read(2048)
+                except (OSError, UnicodeError):
+                    header = ""
+                effective_date = re.search(r"^Effective from:\s*(\d{4}-\d{2}-\d{2})\s*$", header, re.MULTILINE)
+                if effective_date:
+                    line += f"\n   Effective from: {effective_date.group(1)}"
+            lines.append(line)
+        return "\n".join(lines)
 
-    def retrieve_changes(self, params):
+    def retrieve_changes(self, params, original_query=None):
         category_name = params.get("category")
         documentation_name = params.get("documentation")
         version_name = params.get("version")
+
+        # A question about whether a rule was already present in an older
+        # version needs later change events too. The named old version is not
+        # a filter for the change nodes in this case.
+        query_text = (original_query or params.get("query") or "").lower()
+        if any(phrase in query_text for phrase in (
+            "already present", "since when", "which version", "when was",
+            "when did", "first introduced",
+        )):
+            version_name = None
+            params.pop("version", None)
 
         if not category_name:
             return "Error: Parameter 'category' is required for change retrieval."
@@ -187,7 +288,7 @@ class VersionRAGRetrieverDatabase:
         if not query:
             return "Error: Parameter 'query' is required for content retrieval."
         
-        if not self.vdb.has_collection(collection_name=MILVUS_COLLECTION_NAME_VersionRAG):
+        if not self.vdb.has_collection(collection_name=MILVUS_COLLECTION_NAME_VERSIONRAG):
             return "no data indexed"
         
         # create vdb filter from params
@@ -202,12 +303,19 @@ class VersionRAGRetrieverDatabase:
             filters.append(f'type == "{type}"')
         filter_string = " and ".join(filters) if filters else ""
 
-        query_vectors = self.vdb_embedding.encode_queries([query])
+        query_vectors = [self.embedding_client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=query,
+            dimensions=EMBEDDING_DIMENSIONS,
+        ).data[0].embedding]
 
+        # Release notes are evidence for change questions, but they can drown
+        # out policy sections when answering a question about a rule or scope.
+        content_only = type is None
         res = self.vdb.search(
-            collection_name=MILVUS_COLLECTION_NAME_VersionRAG,
+            collection_name=MILVUS_COLLECTION_NAME_VERSIONRAG,
             data=query_vectors,
-            limit=entity_limit,  # number of returned entities
+            limit=entity_limit * 2 if content_only else entity_limit,
             output_fields=[MILVUS_META_ATTRIBUTE_TEXT, 
                            MILVUS_META_ATTRIBUTE_PAGE, 
                            MILVUS_META_ATTRIBUTE_FILE, 
@@ -219,6 +327,11 @@ class VersionRAGRetrieverDatabase:
         )
 
         results = res[0]
+        if content_only:
+            results = [hit for hit in results
+                       if hit["entity"].get(MILVUS_META_ATTRIBUTE_TYPE) == "file"
+                       and not Path(hit["entity"][MILVUS_META_ATTRIBUTE_FILE]).name.endswith("-release-notes.md")]
+            results = results[:entity_limit]
         chunks = [hit["entity"][MILVUS_META_ATTRIBUTE_TEXT] for hit in results]
         page_nrs = [hit["entity"][MILVUS_META_ATTRIBUTE_PAGE] for hit in results]
         source_files = [hit["entity"][MILVUS_META_ATTRIBUTE_FILE] for hit in results]
